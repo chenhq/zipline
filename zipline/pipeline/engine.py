@@ -56,6 +56,8 @@ implements the following algorithm for executing pipelines:
    screen. This logic lives in SimplePipelineEngine._to_narrow.
 """
 from abc import ABCMeta, abstractmethod
+from functools import partial
+
 from six import iteritems, with_metaclass, viewkeys
 from numpy import array
 from pandas import DataFrame, MultiIndex
@@ -73,7 +75,7 @@ from zipline.utils.pandas_utils import explode
 
 from .domain import Domain, GENERIC
 from .graph import maybe_specialize
-from .hook import MultiHook
+from .hooks import DelegatingHooks
 from .term import AssetExists, InputDates, LoadableTerm
 
 from zipline.utils.date_utils import compute_date_range_chunks
@@ -84,7 +86,7 @@ from zipline.utils.sharedoc import copydoc
 class PipelineEngine(with_metaclass(ABCMeta)):
 
     @abstractmethod
-    def run_pipeline(self, pipeline, start_date, end_date):
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
         """
         Compute values for ``pipeline`` between ``start_date`` and
         ``end_date``.
@@ -99,6 +101,8 @@ class PipelineEngine(with_metaclass(ABCMeta)):
             Start date of the computed matrix.
         end_date : pd.Timestamp
             End date of the computed matrix.
+        hooks : list, optional
+            List of hooks to use to instrument Pipeline execution.
 
         Returns
         -------
@@ -117,7 +121,12 @@ class PipelineEngine(with_metaclass(ABCMeta)):
         raise NotImplementedError("run_pipeline")
 
     @abstractmethod
-    def run_chunked_pipeline(self, pipeline, start_date, end_date, chunksize):
+    def run_chunked_pipeline(self,
+                             pipeline,
+                             start_date,
+                             end_date,
+                             chunksize,
+                             hooks=None):
         """
         Compute values for `pipeline` in number of days equal to `chunksize`
         and return stitched up result. Computing in chunks is useful for
@@ -133,6 +142,8 @@ class PipelineEngine(with_metaclass(ABCMeta)):
             The end date to run the pipeline for.
         chunksize : int
             The number of days to execute at a time.
+        hooks : list, optional
+            List of hooks to use to instrument Pipeline execution.
 
         Returns
         -------
@@ -166,13 +177,18 @@ class ExplodingPipelineEngine(PipelineEngine):
     """
     A PipelineEngine that doesn't do anything.
     """
-    def run_pipeline(self, pipeline, start_date, end_date):
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
         raise NoEngineRegistered(
             "Attempted to run a pipeline but no pipeline "
             "resources were registered."
         )
 
-    def run_chunked_pipeline(self, pipeline, start_date, end_date, chunksize):
+    def run_chunked_pipeline(self,
+                             pipeline,
+                             start_date,
+                             end_date,
+                             chunksize,
+                             hooks=None):
         raise NoEngineRegistered(
             "Attempted to run a chunked pipeline but no pipeline "
             "resources were registered."
@@ -229,6 +245,9 @@ class SimplePipelineEngine(PipelineEngine):
         computing a pipeline. See
         :func:`zipline.pipeline.engine.default_populate_initial_workspace`
         for more info.
+    default_hooks : list, optional
+        List of hooks that should be used to instrument all pipelines executed
+        by this engine.
 
     See Also
     --------
@@ -301,6 +320,12 @@ class SimplePipelineEngine(PipelineEngine):
         :meth:`zipline.pipeline.engine.PipelineEngine.run_pipeline`
         :meth:`zipline.pipeline.engine.PipelineEngine.run_chunked_pipeline`
         """
+        if hooks is None:
+            hooks = []
+        hooks = self._resolve_hooks(hooks)
+        return self._run_pipeline_impl(pipeline, start_date, end_date, hooks)
+
+    def _run_pipeline_impl(self, pipeline, start_date, end_date, hooks):
         # See notes at the top of this module for a description of the
         # algorithm implemented here.
         if end_date < start_date:
@@ -309,16 +334,12 @@ class SimplePipelineEngine(PipelineEngine):
                 "start_date=%s, end_date=%s" % (start_date, end_date)
             )
 
-        if hooks is None:
-            hooks = []
-        all_hooks = self._resolve_hooks(hooks)
-
         domain = self.resolve_domain(pipeline)
 
         plan = pipeline.to_execution_plan(
             domain, self._root_mask_term, start_date, end_date,
         )
-        eng_hooks.on_create_execution_plan(plan)
+        hooks.on_create_execution_plan(plan)
 
         extra_rows = plan.extra_rows[self._root_mask_term]
         root_mask = self._compute_root_mask(
@@ -337,14 +358,14 @@ class SimplePipelineEngine(PipelineEngine):
             assets,
         )
 
-        eng_hooks.begin_compute_chunk(
-        results = self.compute_chunk(
-            plan,
-            dates,
-            assets,
-            initial_workspace,
-            eng_hooks,
-        )
+        with hooks.computing_chunk(dates[0], dates[-1]):
+            results = self.compute_chunk(
+                plan,
+                dates,
+                assets,
+                initial_workspace,
+                hooks,
+            )
 
         return self._to_narrow(
             plan.outputs,
@@ -368,12 +389,13 @@ class SimplePipelineEngine(PipelineEngine):
             end_date,
             chunksize,
         )
-
         if hooks is None:
             hooks = []
         hooks = self._resolve_hooks(hooks)
 
-        chunks = [self.run_pipeline(pipeline, s, e) for s, e in ranges]
+        run_pipeline = partial(self._run_pipeline_impl, pipeline, hooks=hooks)
+        with hooks.running_chunked_pipeline(start_date, end_date):
+            chunks = [run_pipeline(s, e) for s, e in ranges]
 
         if len(chunks) == 1:
             # OPTIMIZATION: Don't make an extra copy in `categorical_df_concat`
@@ -510,7 +532,7 @@ class SimplePipelineEngine(PipelineEngine):
                 out.append(input_data)
         return out
 
-    def compute_chunk(self, graph, dates, sids, initial_workspace):
+    def compute_chunk(self, graph, dates, sids, initial_workspace, hooks):
         """
         Compute the Pipeline terms in the graph for the requested start and end
         dates.
@@ -530,6 +552,8 @@ class SimplePipelineEngine(PipelineEngine):
             Must contain at least entry for `self._root_mask_term` whose shape
             is `(len(dates), len(assets))`, but may contain additional
             pre-computed terms for testing or optimization purposes.
+        hooks : implements(PipelineHooks)
+            Hooks to instrument pipeline execution.
 
         Returns
         -------
@@ -578,10 +602,11 @@ class SimplePipelineEngine(PipelineEngine):
         )
 
         for term in graph.execution_order(refcounts):
-            # `term` may have been supplied in `initial_workspace`, and in the
-            # future we may pre-compute loadable terms coming from the same
-            # dataset.  In either case, we will already have an entry for this
-            # term, which we shouldn't re-compute.
+            # `term` may have been supplied in `initial_workspace`, or we may
+            # have loaded `term` as part of a batch with another term coming
+            # from the same loader (see note on loader_group_key above). In
+            # either case, we already have the term computed, so don't
+            # recompute.
             if term in workspace:
                 continue
 
@@ -594,37 +619,38 @@ class SimplePipelineEngine(PipelineEngine):
                 dates,
             )
 
-            if isinstance(term, LoadableTerm):
-                loader = get_loader(term)
-                to_load = sorted(
-                    loader_groups[loader_group_key(term)],
-                    key=lambda t: t.dataset
-                )
-                loaded = loader.load_adjusted_array(
-                    domain, to_load, mask_dates, sids, mask,
-                )
-                assert set(loaded) == set(to_load), (
-                    'loader did not return an AdjustedArray for each column\n'
-                    'expected: %r\n'
-                    'got:      %r' % (sorted(to_load), sorted(loaded))
-                )
-                workspace.update(loaded)
-            else:
-                workspace[term] = term._compute(
-                    self._inputs_for_term(term, workspace, graph, domain),
-                    mask_dates,
-                    sids,
-                    mask,
-                )
-                if term.ndim == 2:
-                    assert workspace[term].shape == mask.shape
+            with hooks.computing_term(term):
+                if isinstance(term, LoadableTerm):
+                    loader = get_loader(term)
+                    to_load = sorted(
+                        loader_groups[loader_group_key(term)],
+                        key=lambda t: t.dataset
+                    )
+                    loaded = loader.load_adjusted_array(
+                        domain, to_load, mask_dates, sids, mask,
+                    )
+                    assert set(loaded) == set(to_load), (
+                        'loader did not return AdjustedArray for each column\n'
+                        'expected: %r\n'
+                        'got:      %r' % (sorted(to_load), sorted(loaded))
+                    )
+                    workspace.update(loaded)
                 else:
-                    assert workspace[term].shape == (mask.shape[0], 1)
+                    workspace[term] = term._compute(
+                        self._inputs_for_term(term, workspace, graph, domain),
+                        mask_dates,
+                        sids,
+                        mask,
+                    )
+                    if term.ndim == 2:
+                        assert workspace[term].shape == mask.shape
+                    else:
+                        assert workspace[term].shape == (mask.shape[0], 1)
 
-                # Decref dependencies of ``term``, and clear any terms whose
-                # refcounts hit 0.
-                for garbage_term in graph.decref_dependencies(term, refcounts):
-                    del workspace[garbage_term]
+                    # Decref dependencies of ``term``, and clear any terms
+                    # whose refcounts hit 0.
+                    for garbage in graph.decref_dependencies(term, refcounts):
+                        del workspace[garbage]
 
         # At this point, all the output terms are in the workspace.
         out = {}
@@ -799,6 +825,4 @@ class SimplePipelineEngine(PipelineEngine):
         )
 
     def _resolve_hooks(self, hooks):
-        """
-        """
-        return MultiHook(list(hooks) + self._default_hooks)
+        return DelegatingHooks(list(hooks) + self._default_hooks)

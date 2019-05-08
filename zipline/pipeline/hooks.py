@@ -1,72 +1,105 @@
 """Pipeline Engine Hooks
 """
-from contextlib import contextmanager
+import time
 
 from interface import Interface, implements
+
+from zipline.utils.compat import contextmanager, wraps
 
 
 class PipelineHooks(Interface):
 
     def on_create_execution_plan(self, plan):
-        pass
+        """Called on resolution of a Pipeline to an ExecutionPlan.
+        """
 
     @contextmanager
-    def on_run_chunked_pipeline(self, start_date, end_date):
-        pass
+    def running_chunked_pipeline(self, start_date, end_date):
+        """Contextmanager entered during execution of run_chunked_pipeline.
+        """
 
     @contextmanager
-    def on_run_pipeline(self, start_date, end_date):
-        return
-        yield
+    def computing_chunk(self, start_date, end_date):
+        """Contextmanager entered during execution of compute_chunk.
+        """
 
     @contextmanager
-    def compute_term(self, term):
-        return
-        yield
+    def computing_term(self, term):
+        """Contextmanager entered during computation of a term.
+        """
 
 
-class NoOpHooks(implements(PipelineHooks)):
-    """
-    A PipelineHooks that defines no-op methods for all available hooks.
+class NoHooks(implements(PipelineHooks)):
+    """A PipelineHooks that defines no-op methods for all available hooks.
 
     Use this as a base class if you only want to implement a subset of all
     possible hooks.
     """
+    def on_create_execution_plan(self, plan):
+        pass
+
+    @contextmanager
+    def running_chunked_pipeline(self, start_date, end_date):
+        yield
+
+    @contextmanager
+    def computing_chunk(self, start_date, end_date):
+        yield
+
+    @contextmanager
+    def computing_term(self, term):
+        yield
 
 
 class LogProgressHook(implements(PipelineHooks)):
-
-    def __init__(self, notify):
-        self.notify = notify
-        self._in_chunked_pipeline = False
+    """A PipelineHooks that logs information about pipeline progress.
+    """
+    def __init__(self, logger=None):
+        if logger is None:
+            logger = logbook.Logger("Pipeline Progress")
+        self.log = logger
 
     def on_create_execution_plan(self, plan):
-        self.notify("Created execution plan.")
+        # Not worth logging anything here.
+        pass
 
     @contextmanager
-    def on_run_chunked_pipeline(self, start_date, end_date):
-        notify = self.notify
-        args = ("pipeline", start_date, end_date)
-        try:
-            self._in_chunked_pipeline = True
-            notify("Running %s from %s to %s" % args)
-            yield
-        finally:
-            notify("Finished running %s from %s to %s" % args)
+    def running_chunked_pipeline(self, start_date, end_date):
+        self.log.info("Running pipeline: {} -> {}", start_date, end_date)
+        start_time = time.time()
+        yield
+        end_time = time.time()
+        self.log.info(
+            "Finished running pipeline: {} -> {}. Execution Time: {} seconds.",
+            start_date, end_date, (end_time - start_time),
+        )
 
     @contextmanager
-    def on_run_pipeline(self, start_date, end_date):
-        notify = self.notify
-        noun = "pipeline chunk" if self._in_chunked_pipeline else "pipeline"
-        args = (noun, start_date, end_date)
-        try:
-            notify("Running %s from %s to %s" % args)
-            yield
-        finally:
-            notify("Finished running %s from %s to %s" % args)
+    def computing_chunk(self, start_date, end_date):
+        self.log.info("Running pipeline chunk: {} -> {}", start_date, end_date)
+        start_time = time.time()
+        yield
+        end_time = time.time()
+        self.log.info(
+            "Finished running pipeline chunk: {} -> {}. "
+            "Execution Time: {} seconds.",
+            start_date, end_date, (end_time - start_time),
+        )
 
+    @contextmanager
+    def computing_term(self, term):
+        repr_ = term.short_repr()
+        self.log.info("Computing {}", repr_)
+        start_time = time.time()
+        yield
+        end_time = time.time()
+        self.log.info(
+            "Finished computing {}. Execution Time: {} seconds",
+            repr_, (end_time - start_time),
+        )
 
 def delegating_hooks_method(method_name):
+    @wraps(getattr(PipelineHooks, method_name))
     def method(self, *args, **kwargs):
         for hook in self._hooks:
             getattr(hook, method_name)(*args, **kwargs)
@@ -78,7 +111,7 @@ class DelegatingHooks(implements(PipelineHooks)):
     """
     def __new__(cls, hooks):
         if len(hooks) == 0:
-            return NoOpHooks()
+            return NoHooks()
         elif len(hooks) == 1:
             return hooks[0]
         else:
