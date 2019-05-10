@@ -88,10 +88,7 @@ class PipelineEngine(with_metaclass(ABCMeta)):
     @abstractmethod
     def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
         """
-        Compute values for ``pipeline`` between ``start_date`` and
-        ``end_date``.
-
-        Returns a DataFrame with a MultiIndex of (date, asset) pairs.
+        Compute values for ``pipeline`` from ``start_date`` to ``end_date``.
 
         Parameters
         ----------
@@ -128,9 +125,11 @@ class PipelineEngine(with_metaclass(ABCMeta)):
                              chunksize,
                              hooks=None):
         """
-        Compute values for `pipeline` in number of days equal to `chunksize`
-        and return stitched up result. Computing in chunks is useful for
-        pipelines computed over a long period of time.
+        Compute values for ``pipeline`` from ``start_date`` to ``end_date``, in
+        date chunks of size ``chunksize``.
+
+        Chunked execution reduces memory consumption, and may reduce
+        computation time depending on the contents of your pipeline.
 
         Parameters
         ----------
@@ -300,6 +299,8 @@ class SimplePipelineEngine(PipelineEngine):
             Start date of the computed matrix.
         end_date : pd.Timestamp
             End date of the computed matrix.
+        hooks : list, optional
+            List of hooks to use to instrument Pipeline execution.
 
         Returns
         -------
@@ -326,6 +327,8 @@ class SimplePipelineEngine(PipelineEngine):
         return self._run_pipeline_impl(pipeline, start_date, end_date, hooks)
 
     def _run_pipeline_impl(self, pipeline, start_date, end_date, hooks):
+        """Shared core for ``run_pipeline`` and ``run_chunked_pipeline``.
+        """
         # See notes at the top of this module for a description of the
         # algorithm implemented here.
         if end_date < start_date:
@@ -394,7 +397,7 @@ class SimplePipelineEngine(PipelineEngine):
         hooks = self._resolve_hooks(hooks)
 
         run_pipeline = partial(self._run_pipeline_impl, pipeline, hooks=hooks)
-        with hooks.running_chunked_pipeline(start_date, end_date):
+        with hooks.running_pipeline(start_date, end_date):
             chunks = [run_pipeline(s, e) for s, e in ranges]
 
         if len(chunks) == 1:
@@ -619,38 +622,39 @@ class SimplePipelineEngine(PipelineEngine):
                 dates,
             )
 
-            with hooks.computing_term(term):
-                if isinstance(term, LoadableTerm):
-                    loader = get_loader(term)
-                    to_load = sorted(
-                        loader_groups[loader_group_key(term)],
-                        key=lambda t: t.dataset
-                    )
+            if isinstance(term, LoadableTerm):
+                loader = get_loader(term)
+                to_load = sorted(
+                    loader_groups[loader_group_key(term)],
+                    key=lambda t: t.dataset
+                )
+                with hooks.loading_terms(to_load):
                     loaded = loader.load_adjusted_array(
                         domain, to_load, mask_dates, sids, mask,
                     )
-                    assert set(loaded) == set(to_load), (
-                        'loader did not return AdjustedArray for each column\n'
-                        'expected: %r\n'
-                        'got:      %r' % (sorted(to_load), sorted(loaded))
-                    )
-                    workspace.update(loaded)
-                else:
+                assert set(loaded) == set(to_load), (
+                    'loader did not return AdjustedArray for each column\n'
+                    'expected: %r\n'
+                    'got:      %r' % (sorted(to_load), sorted(loaded))
+                )
+                workspace.update(loaded)
+            else:
+                with hooks.computing_term(term):
                     workspace[term] = term._compute(
                         self._inputs_for_term(term, workspace, graph, domain),
                         mask_dates,
                         sids,
                         mask,
                     )
-                    if term.ndim == 2:
-                        assert workspace[term].shape == mask.shape
-                    else:
-                        assert workspace[term].shape == (mask.shape[0], 1)
+                if term.ndim == 2:
+                    assert workspace[term].shape == mask.shape
+                else:
+                    assert workspace[term].shape == (mask.shape[0], 1)
 
-                    # Decref dependencies of ``term``, and clear any terms
-                    # whose refcounts hit 0.
-                    for garbage in graph.decref_dependencies(term, refcounts):
-                        del workspace[garbage]
+                # Decref dependencies of ``term``, and clear any terms
+                # whose refcounts hit 0.
+                for garbage in graph.decref_dependencies(term, refcounts):
+                    del workspace[garbage]
 
         # At this point, all the output terms are in the workspace.
         out = {}
