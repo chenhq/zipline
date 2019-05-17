@@ -80,13 +80,12 @@ from .term import AssetExists, InputDates, LoadableTerm
 
 from zipline.utils.date_utils import compute_date_range_chunks
 from zipline.utils.pandas_utils import categorical_df_concat
-from zipline.utils.sharedoc import copydoc
 
 
 class PipelineEngine(with_metaclass(ABCMeta)):
 
     @abstractmethod
-    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
+    def run_pipeline(self, pipeline, start_date, end_date):
         """
         Compute values for ``pipeline`` from ``start_date`` to ``end_date``.
 
@@ -98,8 +97,6 @@ class PipelineEngine(with_metaclass(ABCMeta)):
             Start date of the computed matrix.
         end_date : pd.Timestamp
             End date of the computed matrix.
-        hooks : list, optional
-            List of hooks to use to instrument Pipeline execution.
 
         Returns
         -------
@@ -122,8 +119,7 @@ class PipelineEngine(with_metaclass(ABCMeta)):
                              pipeline,
                              start_date,
                              end_date,
-                             chunksize,
-                             hooks=None):
+                             chunksize):
         """
         Compute values for ``pipeline`` from ``start_date`` to ``end_date``, in
         date chunks of size ``chunksize``.
@@ -141,8 +137,6 @@ class PipelineEngine(with_metaclass(ABCMeta)):
             The end date to run the pipeline for.
         chunksize : int
             The number of days to execute at a time.
-        hooks : list, optional
-            List of hooks to use to instrument Pipeline execution.
 
         Returns
         -------
@@ -287,20 +281,31 @@ class SimplePipelineEngine(PipelineEngine):
         else:
             self._default_hooks = list(default_hooks)
 
-    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
+    def run_chunked_pipeline(self,
+                             pipeline,
+                             start_date,
+                             end_date,
+                             chunksize,
+                             hooks=None):
         """
-        Compute a pipeline.
+        Compute values for ``pipeline`` from ``start_date`` to ``end_date``, in
+        date chunks of size ``chunksize``.
+
+        Chunked execution reduces memory consumption, and may reduce
+        computation time depending on the contents of your pipeline.
 
         Parameters
         ----------
-        pipeline : zipline.pipeline.Pipeline
+        pipeline : Pipeline
             The pipeline to run.
         start_date : pd.Timestamp
-            Start date of the computed matrix.
+            The start date to run the pipeline for.
         end_date : pd.Timestamp
-            End date of the computed matrix.
-        hooks : list, optional
-            List of hooks to use to instrument Pipeline execution.
+            The end date to run the pipeline for.
+        chunksize : int
+            The number of days to execute at a time.
+        hooks : list[implements(PipelineHooks)], optional
+            Hooks for instrumenting Pipeline execution.
 
         Returns
         -------
@@ -319,12 +324,75 @@ class SimplePipelineEngine(PipelineEngine):
         See Also
         --------
         :meth:`zipline.pipeline.engine.PipelineEngine.run_pipeline`
-        :meth:`zipline.pipeline.engine.PipelineEngine.run_chunked_pipeline`
         """
+        domain = self.resolve_domain(pipeline)
+        ranges = compute_date_range_chunks(
+            domain.all_sessions(),
+            start_date,
+            end_date,
+            chunksize,
+        )
         if hooks is None:
             hooks = []
         hooks = self._resolve_hooks(hooks)
-        return self._run_pipeline_impl(pipeline, start_date, end_date, hooks)
+
+        run_pipeline = partial(self._run_pipeline_impl, pipeline, hooks=hooks)
+        with hooks.running_pipeline(pipeline,
+                                    start_date,
+                                    end_date,
+                                    chunked=True):
+            chunks = [run_pipeline(s, e) for s, e in ranges]
+
+        if len(chunks) == 1:
+            # OPTIMIZATION: Don't make an extra copy in `categorical_df_concat`
+            # if we don't have to.
+            return chunks[0]
+
+        return categorical_df_concat(chunks, inplace=True)
+
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
+        """
+        Compute values for ``pipeline`` from ``start_date`` to ``end_date``.
+
+        Parameters
+        ----------
+        pipeline : zipline.pipeline.Pipeline
+            The pipeline to run.
+        start_date : pd.Timestamp
+            Start date of the computed matrix.
+        end_date : pd.Timestamp
+            End date of the computed matrix.
+        hooks : list[implements(PipelineHooks)], optional
+            Hooks for instrumenting Pipeline execution.
+
+        Returns
+        -------
+        result : pd.DataFrame
+            A frame of computed results.
+
+            The ``result`` columns correspond to the entries of
+            `pipeline.columns`, which should be a dictionary mapping strings to
+            instances of :class:`zipline.pipeline.term.Term`.
+
+            For each date between ``start_date`` and ``end_date``, ``result``
+            will contain a row for each asset that passed `pipeline.screen`.
+            A screen of ``None`` indicates that a row should be returned for
+            each asset that existed each day.
+        """
+        if hooks is None:
+            hooks = []
+
+        hooks = self._resolve_hooks(hooks)
+        with hooks.running_pipeline(pipeline,
+                                    start_date,
+                                    end_date,
+                                    chunked=False):
+            return self._run_pipeline_impl(
+                pipeline,
+                start_date,
+                end_date,
+                hooks,
+            )
 
     def _run_pipeline_impl(self, pipeline, start_date, end_date, hooks):
         """Shared core for ``run_pipeline`` and ``run_chunked_pipeline``.
@@ -361,7 +429,7 @@ class SimplePipelineEngine(PipelineEngine):
             assets,
         )
 
-        with hooks.computing_chunk(dates[0], dates[-1]):
+        with hooks.computing_chunk(plan, start_date, end_date):
             results = self.compute_chunk(
                 plan,
                 dates,
@@ -377,35 +445,6 @@ class SimplePipelineEngine(PipelineEngine):
             dates[extra_rows:],
             assets,
         )
-
-    @copydoc(PipelineEngine.run_chunked_pipeline)
-    def run_chunked_pipeline(self,
-                             pipeline,
-                             start_date,
-                             end_date,
-                             chunksize,
-                             hooks=None):
-        domain = self.resolve_domain(pipeline)
-        ranges = compute_date_range_chunks(
-            domain.all_sessions(),
-            start_date,
-            end_date,
-            chunksize,
-        )
-        if hooks is None:
-            hooks = []
-        hooks = self._resolve_hooks(hooks)
-
-        run_pipeline = partial(self._run_pipeline_impl, pipeline, hooks=hooks)
-        with hooks.running_pipeline(start_date, end_date):
-            chunks = [run_pipeline(s, e) for s, e in ranges]
-
-        if len(chunks) == 1:
-            # OPTIMIZATION: Don't make an extra copy in `categorical_df_concat`
-            # if we don't have to.
-            return chunks[0]
-
-        return categorical_df_concat(chunks, inplace=True)
 
     def _compute_root_mask(self, domain, start_date, end_date, extra_rows):
         """

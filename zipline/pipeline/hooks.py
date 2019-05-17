@@ -1,26 +1,36 @@
 """Pipeline Engine Hooks
 """
+import cgi
 import time
 
 from interface import Interface, implements
 import logbook
+import pandas as pd
 
 from zipline.utils.compat import contextmanager, wraps
 
 
 class PipelineHooks(Interface):
+    """
+    Interface for instrumenting PipelineEngine methods.
+
+    Implementations of this interface can be passed to the ``hooks`` parameter
+    of SimplePipelineEngine
+    """
 
     def on_create_execution_plan(self, plan):
         """Called on resolution of a Pipeline to an ExecutionPlan.
         """
 
     @contextmanager
-    def running_chunked_pipeline(self, start_date, end_date):
-        """Contextmanager entered during execution of run_chunked_pipeline.
+    def running_pipeline(self, pipeline, start_date, end_date, chunked):
+        """
+        Contextmanager entered during execution of run_pipeline or
+        run_chunked_pipeline.
         """
 
     @contextmanager
-    def computing_chunk(self, start_date, end_date):
+    def computing_chunk(self, plan, start_date, end_date):
         """Contextmanager entered during execution of compute_chunk.
         """
 
@@ -45,11 +55,11 @@ class NoHooks(implements(PipelineHooks)):
         pass
 
     @contextmanager
-    def running_chunked_pipeline(self, start_date, end_date):
+    def running_pipeline(self, pipeline, start_date, end_date, chunked):
         yield
 
     @contextmanager
-    def computing_chunk(self, start_date, end_date):
+    def computing_chunk(self, plan, start_date, end_date):
         yield
 
     @contextmanager
@@ -70,7 +80,6 @@ class LoggingHooks(implements(PipelineHooks)):
         self.log = logger
 
     def on_create_execution_plan(self, plan):
-        # Not worth logging anything here.
         pass
 
     @contextmanager
@@ -85,13 +94,18 @@ class LoggingHooks(implements(PipelineHooks)):
         )
 
     @contextmanager
-    def running_chunked_pipeline(self, start_date, end_date):
-        with self._log_duration("running pipeline: {} -> {}",
-                                start_date, end_date):
+    def running_pipeline(self, pipeline, start_date, end_date, chunked):
+        if chunked:
+            modifier = " chunked"
+        else:
+            modifier = ""
+
+        with self._log_duration("running{} pipeline: {} -> {}",
+                                modifier, start_date, end_date):
             yield
 
     @contextmanager
-    def computing_chunk(self, start_date, end_date):
+    def computing_chunk(self, plan, start_date, end_date):
         with self._log_duration("running pipeline chunk: {} -> {}",
                                 start_date, end_date):
             yield
@@ -111,7 +125,7 @@ class LoggingHooks(implements(PipelineHooks)):
         )
 
     @contextmanager
-    def computing_terms(self, term):
+    def computing_term(self, term):
         with self._log_duration("computing {}", term):
             yield
 
@@ -150,31 +164,155 @@ del delegating_hooks_method
 
 
 try:
-    import tqdm
-    HAVE_TQDM = True
+    import ipywidgets
+    from IPython.display import display
+    HAVE_WIDGETS = True
 except ImportError:
-    HAVE_TQDM = False
+    HAVE_WIDGETS = False
 
 
-class ProgressBarHooks(NoHooks):
+class ProgressBarHooks(implements(PipelineHooks)):
+    """Hooks that ipywidgets to display progress in a Jupyter Notebook.
+    """
 
     def __init__(self):
-        if not HAVE_TQDM:
-            raise RuntimeError(
-                "tqdm must be installed to use ProgressBarHooks"
-            )
-        self._state = None
+        self._bar = None
 
     @contextmanager
-    def running_chunked_pipeline(self, start_date, end_date):
+    def running_pipeline(self, pipeline, start_date, end_date, chunked):
+        if chunked:
+            self._bar = ChunkedProgress(start_date, end_date)
+        else:
+            self._bar = UnchunkedProgress(start_date, end_date)
+
+        with self._bar:
+            try:
+                yield
+            finally:
+                self._bar = None
+
+    @contextmanager
+    def computing_chunk(self, plan, start_date, end_date):
+        self._bar.start_chunk(len(plan), start_date, end_date)
         try:
             yield
         finally:
-            self.__init__()
+            self._bar.finish_chunk()
+
+    @contextmanager
+    def loading_terms(self, terms):
+        self._bar.start_load_terms(terms)
+        try:
+            yield
+        finally:
+            self._bar.finish_load_terms(terms)
+
+    @contextmanager
+    def computing_term(self, term):
+        self._bar.start_compute_term(term)
+        try:
+            yield
+        finally:
+            self._bar.finish_compute_term(term)
 
     def on_create_execution_plan(self, plan):
-        pass
+        self._bar.set_num_terms(len(plan))
 
-    class _State(object):
 
-        def __init__(
+class ChunkedProgress(object):
+
+    def __init__(self, start_date, end_date):
+        self._start_date = start_date
+        self._end_date = end_date
+        self._total_days = (end_date - start_date).days + 1
+
+        self._heading = ipywidgets.HTML()
+
+        self._bar = ipywidgets.IntProgress(
+            bar_style='info',
+            layout={'width': '600px'},
+        )
+
+        self._percent_indicator = ipywidgets.Label()
+
+        self._current_action = ipywidgets.HTML(
+            value='<b>Analyzing Pipeline...</b>',
+            layout={
+                'height': '250px',
+            }
+        )
+
+        self._layout = ipywidgets.VBox([
+            self._heading,
+            ipywidgets.HBox(
+                [self._percent_indicator, self._bar],
+            ),
+            self._current_action,
+        ])
+
+        self._start_time = None
+        self._num_terms = None
+        self._days_completed = 0
+        self._current_chunk_days = None
+
+    def set_num_terms(self, nterms):
+        self._bar.max = nterms * self._total_days
+
+    def __enter__(self):
+        self._start_time = time.time()
+        display(self._layout)
+
+    def __exit__(self, *args):
+        # TODO: Handle error.
+        self._bar.bar_style = 'success'
+        import humanize
+        self._heading.value = "<b>Computed Pipeline:</b> Start={}, End={}".format(self._start_date.date(), self._end_date.date())
+        self._current_action.value = "<b>Total Execution Time:</b> {}.".format(humanize.naturaldelta(time.time() - self._start_time))
+        self._current_action.layout = {'height': ''}
+
+    def start_chunk(self, nterms, start_date, end_date):
+        # +1 to be inclusive of end date.
+        days_since_start = (end_date - self._start_date).days + 1
+        self._current_chunk_days = days_since_start - self._days_completed
+        self._heading.value = (
+            "<b>Running Pipeline</b>: Chunk Start={}, Chunk End={}".format(
+                start_date.date(), end_date.date(),
+            )
+        )
+        self._increment_progress(1)  # hack: Account for AssetExists().
+
+    def finish_chunk(self):
+        self._days_completed += self._current_chunk_days
+
+    def start_load_terms(self, terms):
+        header = '<b>Loading Inputs:</b>'
+        entries = ''.join([
+            '<li><pre>{}</pre></li>'.format(cgi.escape(str(t)))
+            for t in terms
+        ])
+        status = '{}<ul>{}</ul>'.format(header, entries)
+        self._current_action.value = status
+
+    def finish_load_terms(self, terms):
+        self._increment_progress(nterms=len(terms))
+
+    def start_compute_term(self, term):
+        self._current_action.value = '<b>Computing Expression:</b><ul><li><pre>{}</pre></li></ul>'.format(cgi.escape(str(term.recursive_repr())))
+
+    def finish_compute_term(self, term):
+        self._increment_progress(nterms=1)
+
+    def _increment_progress(self, nterms):
+        self._set_progress(self._bar.value + nterms * self._current_chunk_days)
+
+    def _set_progress(self, term_days):
+        bar = self._bar
+        bar.value = term_days
+        percent = (bar.value - bar.min) / float(bar.max - bar.min) * 100.0
+        self._percent_indicator.value = "{0:.2f}% Complete".format(percent)
+
+
+class UnchunkedProgress(object):
+
+    def __init__(self, start_date, end_date):
+        raise AssertionError('not ready')
