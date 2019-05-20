@@ -337,10 +337,7 @@ class SimplePipelineEngine(PipelineEngine):
         hooks = self._resolve_hooks(hooks)
 
         run_pipeline = partial(self._run_pipeline_impl, pipeline, hooks=hooks)
-        with hooks.running_pipeline(pipeline,
-                                    start_date,
-                                    end_date,
-                                    chunked=True):
+        with hooks.running_pipeline(pipeline, start_date, end_date):
             chunks = [run_pipeline(s, e) for s, e in ranges]
 
         if len(chunks) == 1:
@@ -383,10 +380,7 @@ class SimplePipelineEngine(PipelineEngine):
             hooks = []
 
         hooks = self._resolve_hooks(hooks)
-        with hooks.running_pipeline(pipeline,
-                                    start_date,
-                                    end_date,
-                                    chunked=False):
+        with hooks.running_pipeline(pipeline, start_date, end_date):
             return self._run_pipeline_impl(
                 pipeline,
                 start_date,
